@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""MTK image header tool (portable replacement for the 32-bit i386 binary).
+
+Writes a 512-byte header followed by the payload on stdout:
+    u32 magic   = 0x58881688
+    u32 size    = payload size in bytes
+    char name[32]  (NUL padded)
+    bytes 40..511  = 0xFF
+"""
+import os
+import struct
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        sys.stderr.write("Usage: mkimage <image_file> <image_name>\n")
+        return 1
+    path, name = sys.argv[1], sys.argv[2]
+    size = os.path.getsize(path)
+
+    header = bytearray(b"\xff" * 512)
+    struct.pack_into("<I", header, 0, 0x58881688)
+    struct.pack_into("<I", header, 4, size)
+    header[8:40] = name.encode("ascii")[:32].ljust(32, b"\x00")
+
+    out = sys.stdout.buffer
+    out.write(header)
+    with open(path, "rb") as payload:
+        while True:
+            chunk = payload.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
+    out.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
