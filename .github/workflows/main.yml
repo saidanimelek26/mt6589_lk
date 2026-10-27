@@ -1,0 +1,105 @@
+name: Build MT6589 LK
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "LK project configuration"
+        required: true
+        default: "asus"
+        type: string
+
+  push:
+    paths:
+      - "bootable/bootloader/lk/**"
+      - "build.sh"
+      - ".github/workflows/build-lk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build LK Bootloader
+    runs-on: ubuntu-22.04
+
+    env:
+      PROJECT: ${{ inputs.project || 'asus' }}
+      TOOLCHAIN_PREFIX: arm-linux-androideabi-
+      TOOLCHAIN_BIN: ${{ github.workspace }}/toolchain/bin
+      LC_ALL: C
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            make \
+            gcc \
+            g++ \
+            python3 \
+            perl \
+            git
+
+      - name: Download ARM toolchain
+        run: |
+          mkdir -p "$TOOLCHAIN_BIN"
+
+          TOOLCHAIN_URL="https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip"
+
+          curl -fL "$TOOLCHAIN_URL" -o "$RUNNER_TEMP/ndk.zip"
+          mkdir -p "$RUNNER_TEMP/ndk"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP/ndk"
+
+          TOOLCHAIN_SOURCE="$RUNNER_TEMP/ndk/android-ndk-r10e/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin"
+
+          test -x "$TOOLCHAIN_SOURCE/arm-linux-androideabi-gcc"
+
+          cp -a "$TOOLCHAIN_SOURCE/." "$TOOLCHAIN_BIN/"
+
+      - name: Verify toolchain
+        run: |
+          "$TOOLCHAIN_BIN/${TOOLCHAIN_PREFIX}gcc" --version
+          test -d bootable/bootloader/lk
+
+      - name: Build LK
+        run: |
+          cd bootable/bootloader/lk
+
+          make clean PROJECT="$PROJECT" || true
+
+          make "$PROJECT" \
+            TOOLCHAIN_PREFIX="$TOOLCHAIN_BIN/$TOOLCHAIN_PREFIX"
+
+      - name: Collect build artifacts
+        run: |
+          set -euo pipefail
+
+          LK_DIR="$GITHUB_WORKSPACE/bootable/bootloader/lk"
+          OUT="$LK_DIR/build/build-$PROJECT"
+          ARTIFACTS="$GITHUB_WORKSPACE/artifacts"
+
+          mkdir -p "$ARTIFACTS"
+
+          for file in lk lk.bin lk-no-mtk-header.bin; do
+            if [ ! -f "$OUT/$file" ]; then
+              echo "::error::Missing build output: $OUT/$file"
+              exit 1
+            fi
+
+            cp -f "$OUT/$file" "$ARTIFACTS/"
+          done
+
+          ls -lh "$ARTIFACTS"
+
+      - name: Upload LK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt6589-lk-${{ inputs.project || 'asus' }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
