@@ -1,36 +1,45 @@
+
 name: Build MT6589 LK
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "bootable/bootloader/lk/**"
+      - ".github/workflows/build-lk.yml"
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       project:
-        description: "LK project configuration"
+        description: "LK project to build"
         required: true
         default: "asus"
         type: string
 
-  push:
-    paths:
-      - "bootable/bootloader/lk/**"
-      - "build.sh"
-      - ".github/workflows/build-lk.yml"
-
 permissions:
   contents: read
 
+concurrency:
+  group: mt6589-lk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: Build LK Bootloader
+    name: Build LK (${{ inputs.project || 'asus' }})
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
 
     env:
       PROJECT: ${{ inputs.project || 'asus' }}
       TOOLCHAIN_PREFIX: arm-linux-androideabi-
       TOOLCHAIN_BIN: ${{ github.workspace }}/toolchain/bin
-      LC_ALL: C
+      DEBIAN_FRONTEND: noninteractive
 
     steps:
-      - name: Checkout source
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install build dependencies
@@ -38,44 +47,109 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
-            make \
-            gcc \
-            g++ \
+            bc \
+            bison \
+            flex \
+            git \
+            wget \
+            curl \
+            unzip \
             python3 \
             perl \
-            git
+            make \
+            file \
+            libncurses5-dev \
+            libssl-dev
 
-      - name: Download ARM toolchain
+      - name: Download Android NDK r10e toolchain
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p "$TOOLCHAIN_BIN"
+          cd "$RUNNER_TEMP"
 
-          TOOLCHAIN_URL="https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip"
+          wget -q \
+            https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip \
+            -O android-ndk-r10e.zip
 
-          curl -fL "$TOOLCHAIN_URL" -o "$RUNNER_TEMP/ndk.zip"
-          mkdir -p "$RUNNER_TEMP/ndk"
-          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP/ndk"
+          unzip -q android-ndk-r10e.zip
 
-          TOOLCHAIN_SOURCE="$RUNNER_TEMP/ndk/android-ndk-r10e/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin"
+          TOOLCHAIN_SOURCE="$RUNNER_TEMP/android-ndk-r10e/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin"
 
-          test -x "$TOOLCHAIN_SOURCE/arm-linux-androideabi-gcc"
+          if [[ ! -x "$TOOLCHAIN_SOURCE/arm-linux-androideabi-gcc" ]]; then
+            echo "::error::Android NDK r10e ARM GCC was not found."
+            exit 1
+          fi
 
           cp -a "$TOOLCHAIN_SOURCE/." "$TOOLCHAIN_BIN/"
 
-      - name: Verify toolchain
-        run: |
-          "$TOOLCHAIN_BIN/${TOOLCHAIN_PREFIX}gcc" --version
-          test -d bootable/bootloader/lk
+          "$TOOLCHAIN_BIN/arm-linux-androideabi-gcc" --version
 
-      - name: Build LK
+      - name: Validate source tree
+        shell: bash
         run: |
+          set -euo pipefail
+
+          LK_DIR="$GITHUB_WORKSPACE/bootable/bootloader/lk"
+
+          if [[ ! -d "$LK_DIR" ]]; then
+            echo "::error::LK source directory not found: $LK_DIR"
+            exit 1
+          fi
+
+          if [[ ! -f "$LK_DIR/makefile" ]]; then
+            echo "::error::LK makefile not found."
+            find "$LK_DIR" -maxdepth 2 -type f | head -100
+            exit 1
+          fi
+
+          if [[ ! -f "$LK_DIR/arch/arm/compile.mk" ]]; then
+            echo "::error::Expected arch/arm/compile.mk is missing."
+            find "$LK_DIR/arch" -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+
+          echo "LK source: $LK_DIR"
+          echo "Project: $PROJECT"
+          echo "Toolchain: $TOOLCHAIN_BIN/$TOOLCHAIN_PREFIX"
+
+      - name: Diagnose architecture configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
           cd bootable/bootloader/lk
 
-          make clean PROJECT="$PROJECT" || true
+          echo "===== make/build.mk lines 80-110 ====="
+          sed -n '80,110p' make/build.mk
+
+          echo "===== Architecture-related definitions ====="
+          grep -RInE \
+            '(^|[[:space:]])(ARCH|arch|TARGET_ARCH|ARCHITECTURE)[[:space:]]*[:?+]?=' \
+            makefile make build.mk project 2>/dev/null || true
+
+          echo "===== Available architecture directories ====="
+          find arch -maxdepth 2 -type f -name 'compile.mk' -print
+
+      - name: Build LK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LK_DIR="$GITHUB_WORKSPACE/bootable/bootloader/lk"
+          cd "$LK_DIR"
+
+          export LC_ALL=C
+
+          echo "Building project: $PROJECT"
 
           make "$PROJECT" \
+            ARCH=arm \
             TOOLCHAIN_PREFIX="$TOOLCHAIN_BIN/$TOOLCHAIN_PREFIX"
 
-      - name: Collect build artifacts
+      - name: Collect build outputs
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -85,18 +159,32 @@ jobs:
 
           mkdir -p "$ARTIFACTS"
 
-          for file in lk lk.bin lk-no-mtk-header.bin; do
-            if [ ! -f "$OUT/$file" ]; then
-              echo "::error::Missing build output: $OUT/$file"
-              exit 1
-            fi
+          echo "Checking build output directory: $OUT"
 
-            cp -f "$OUT/$file" "$ARTIFACTS/"
+          if [[ ! -d "$OUT" ]]; then
+            echo "::error::Build output directory not found: $OUT"
+            find "$LK_DIR/build" -maxdepth 3 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          for file in lk lk.bin lk-no-mtk-header.bin; do
+            if [[ -f "$OUT/$file" ]]; then
+              cp -f "$OUT/$file" "$ARTIFACTS/"
+              echo "Collected: $file"
+            else
+              echo "::warning::Output not generated: $OUT/$file"
+            fi
           done
 
+          if [[ -z "$(find "$ARTIFACTS" -maxdepth 1 -type f -print -quit)" ]]; then
+            echo "::error::No build artifacts were produced."
+            exit 1
+          fi
+
+          echo "===== Collected artifacts ====="
           ls -lh "$ARTIFACTS"
 
-      - name: Upload LK artifacts
+      - name: Upload LK build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mt6589-lk-${{ inputs.project || 'asus' }}
